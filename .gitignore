@@ -1,6 +1,4 @@
 # regenerable / large binaries - see scripts/ to rebuild, Releases for binaries
-/reference/
-/src-kernel/
 /out/
 /*.tar.gz
 /series-repo/
