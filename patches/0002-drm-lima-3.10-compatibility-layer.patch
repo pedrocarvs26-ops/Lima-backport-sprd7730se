@@ -1,6 +1,6 @@
-From 711ad42f2db5797f6d0cb7232d50e7e6a0bf61fd Mon Sep 17 00:00:00 2001
+From e0394c38d3b07e0c19865e42ad21157862fc3406 Mon Sep 17 00:00:00 2001
 From: "lima 3.10 backport" <backport@lima.local>
-Date: Tue, 18 Aug 2026 23:30:30 +0000
+Date: Wed, 19 Aug 2026 00:41:08 +0000
 Subject: [PATCH 2/6] drm/lima: 3.10 compatibility layer
 
 lima_compat.h: shims for post-3.10 API used by the v5.2 driver:

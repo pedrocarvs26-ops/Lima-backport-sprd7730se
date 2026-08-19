@@ -1,6 +1,6 @@
-From c0caa2a93f9fb4d1c155f105c75fea7b96c1158c Mon Sep 17 00:00:00 2001
+From 755bb4862134e84069cd1c4904d5df40b0de05c2 Mon Sep 17 00:00:00 2001
 From: "lima 3.10 backport" <backport@lima.local>
-Date: Tue, 18 Aug 2026 23:30:30 +0000
+Date: Wed, 19 Aug 2026 00:41:08 +0000
 Subject: [PATCH 6/6] tools: lima_smoke - minimal lima UAPI ioctl harness
 
 VERSION + GET_PARAM x4 + CTX_CREATE + GEM_CREATE + GEM_INFO + mmap/CPU

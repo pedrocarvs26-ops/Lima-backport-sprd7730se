@@ -1,6 +1,6 @@
-From 4c90edd43f62c9b24303b2e14f594a83896efd5b Mon Sep 17 00:00:00 2001
+From 175df5e6452c3b3655ad66690b88bfa5bd1bb147 Mon Sep 17 00:00:00 2001
 From: "lima 3.10 backport" <backport@lima.local>
-Date: Tue, 18 Aug 2026 23:30:30 +0000
+Date: Wed, 19 Aug 2026 00:41:08 +0000
 Subject: [PATCH 3/6] drm/lima: backport v5.2 lima driver to Linux 3.10
  (SC7730SE)
 
@@ -59,7 +59,7 @@ Rewritten for 3.10:
  drivers/gpu/drm/lima/lima_object.c        | 191 ++++++++++
  drivers/gpu/drm/lima/lima_object.h        |  42 +++
  drivers/gpu/drm/lima/lima_platform.h      |  29 ++
- drivers/gpu/drm/lima/lima_platform_sprd.c | 148 ++++++++
+ drivers/gpu/drm/lima/lima_platform_sprd.c | 155 ++++++++
  drivers/gpu/drm/lima/lima_pmu.c           |  61 +++
  drivers/gpu/drm/lima/lima_pmu.h           |  12 +
  drivers/gpu/drm/lima/lima_pp.c            | 429 +++++++++++++++++++++
@@ -69,7 +69,7 @@ Rewritten for 3.10:
  drivers/gpu/drm/lima/lima_sched.h         | 136 +++++++
  drivers/gpu/drm/lima/lima_vm.c            | 284 ++++++++++++++
  drivers/gpu/drm/lima/lima_vm.h            |  62 ++++
- 35 files changed, 4282 insertions(+)
+ 35 files changed, 4289 insertions(+)
  create mode 100755 drivers/gpu/drm/lima/Kconfig
  create mode 100755 drivers/gpu/drm/lima/Makefile
  create mode 100755 drivers/gpu/drm/lima/lima_bcast.c
@@ -2798,10 +2798,10 @@ index 0000000..aa068d6
 +#endif
 diff --git a/drivers/gpu/drm/lima/lima_platform_sprd.c b/drivers/gpu/drm/lima/lima_platform_sprd.c
 new file mode 100755
-index 0000000..c688725
+index 0000000..913e4e2
 --- /dev/null
 +++ b/drivers/gpu/drm/lima/lima_platform_sprd.c
-@@ -0,0 +1,148 @@
+@@ -0,0 +1,155 @@
 +// SPDX-License-Identifier: GPL-2.0 OR MIT
 +/*
 + * lima_platform_sprd.c - Spreadtrum SC7730SE (scx30g2) platform glue for
@@ -2850,16 +2850,19 @@ index 0000000..c688725
 +#include "lima_device.h"
 +#include "lima_platform.h"
 +
-+#define SPRD_GPU_PD_TIMEOUT_JIFFIES	msecs_to_jiffies(2000)
-+
 +/*
 + * Triple-read the domain status until stable (the PMU status register
-+ * is sampled asynchronously); mirrors the vendor sprd_gpu_domain_state().
++ * is sampled asynchronously); mirrors the vendor sprd_gpu_domain_state(),
++ * but BOUNDED: the vendor loop only prints on timeout and keeps spinning,
++ * which wedges boot if the PMU status never settles (wrong state bits,
++ * dead PMU clock, ...). Give up after ~100k triple-reads and return the
++ * last sample; the caller then fails probe with -ETIMEDOUT instead of
++ * hanging the machine.
 + */
 +static u32 sprd_gpu_domain_state(void)
 +{
 +	u32 s1, s2, s3;
-+	unsigned long timeout = jiffies + SPRD_GPU_PD_TIMEOUT_JIFFIES;
++	int tries = 100000;
 +
 +	do {
 +		cpu_relax();
@@ -2869,10 +2872,12 @@ index 0000000..c688725
 +				  BITS_PD_GPU_TOP_STATE(-1));
 +		s3 = sci_glb_read(REG_PMU_APB_PWR_STATUS0_DBG,
 +				  BITS_PD_GPU_TOP_STATE(-1));
-+		if (time_after(jiffies, timeout))
++		if (!--tries) {
 +			pr_emerg("lima: gpu domain status stuck, state %08x eb0 %08x\n",
 +				 sci_glb_read(REG_PMU_APB_PWR_STATUS0_DBG, -1),
 +				 sci_glb_read(REG_AON_APB_APB_EB0, -1));
++			break;
++		}
 +	} while (s1 != s2 || s2 != s3);
 +
 +	return s1;
@@ -2899,6 +2904,8 @@ index 0000000..c688725
 +{
 +	struct device *dev = ldev->dev;
 +	int ret;
++
++	dev_info(dev, "sprd gpu: powering on PD_GPU_TOP domain\n");
 +
 +	/* power-on delays (vendor values) */
 +	sci_glb_write(REG_PMU_APB_PD_GPU_TOP_CFG,

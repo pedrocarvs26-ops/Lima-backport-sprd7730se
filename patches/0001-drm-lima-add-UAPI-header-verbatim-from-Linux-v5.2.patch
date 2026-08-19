@@ -1,6 +1,6 @@
-From 4a1f05eaa23c8ae013bb0417e9c8bc57fc925fe5 Mon Sep 17 00:00:00 2001
+From ea5bcfafb67bdbf6b9f18364428b15930e427a79 Mon Sep 17 00:00:00 2001
 From: "lima 3.10 backport" <backport@lima.local>
-Date: Tue, 18 Aug 2026 23:30:30 +0000
+Date: Wed, 19 Aug 2026 00:41:07 +0000
 Subject: [PATCH 1/6] drm/lima: add UAPI header verbatim from Linux v5.2
 
 include/uapi/drm/lima_drm.h as merged upstream in v5.2. The lima UAPI is

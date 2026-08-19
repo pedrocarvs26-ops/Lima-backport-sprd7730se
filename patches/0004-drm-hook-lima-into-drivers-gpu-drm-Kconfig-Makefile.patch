@@ -1,6 +1,6 @@
-From a51cd68d7f7fb8194062bc61de87f082c3115b65 Mon Sep 17 00:00:00 2001
+From 1644f5ad7e9a40117ca0bc6137f10b77ccf7c317 Mon Sep 17 00:00:00 2001
 From: "lima 3.10 backport" <backport@lima.local>
-Date: Tue, 18 Aug 2026 23:30:30 +0000
+Date: Wed, 19 Aug 2026 00:41:08 +0000
 Subject: [PATCH 4/6] drm: hook lima into drivers/gpu/drm Kconfig/Makefile
 
 Two lines against the vanilla 3.10.103 files. If your vendor tree

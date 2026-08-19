@@ -46,16 +46,19 @@
 #include "lima_device.h"
 #include "lima_platform.h"
 
-#define SPRD_GPU_PD_TIMEOUT_JIFFIES	msecs_to_jiffies(2000)
-
 /*
  * Triple-read the domain status until stable (the PMU status register
- * is sampled asynchronously); mirrors the vendor sprd_gpu_domain_state().
+ * is sampled asynchronously); mirrors the vendor sprd_gpu_domain_state(),
+ * but BOUNDED: the vendor loop only prints on timeout and keeps spinning,
+ * which wedges boot if the PMU status never settles (wrong state bits,
+ * dead PMU clock, ...). Give up after ~100k triple-reads and return the
+ * last sample; the caller then fails probe with -ETIMEDOUT instead of
+ * hanging the machine.
  */
 static u32 sprd_gpu_domain_state(void)
 {
 	u32 s1, s2, s3;
-	unsigned long timeout = jiffies + SPRD_GPU_PD_TIMEOUT_JIFFIES;
+	int tries = 100000;
 
 	do {
 		cpu_relax();
@@ -65,10 +68,12 @@ static u32 sprd_gpu_domain_state(void)
 				  BITS_PD_GPU_TOP_STATE(-1));
 		s3 = sci_glb_read(REG_PMU_APB_PWR_STATUS0_DBG,
 				  BITS_PD_GPU_TOP_STATE(-1));
-		if (time_after(jiffies, timeout))
+		if (!--tries) {
 			pr_emerg("lima: gpu domain status stuck, state %08x eb0 %08x\n",
 				 sci_glb_read(REG_PMU_APB_PWR_STATUS0_DBG, -1),
 				 sci_glb_read(REG_AON_APB_APB_EB0, -1));
+			break;
+		}
 	} while (s1 != s2 || s2 != s3);
 
 	return s1;
@@ -95,6 +100,8 @@ static int sprd_gpu_power_on_builtin(struct lima_device *ldev)
 {
 	struct device *dev = ldev->dev;
 	int ret;
+
+	dev_info(dev, "sprd gpu: powering on PD_GPU_TOP domain\n");
 
 	/* power-on delays (vendor values) */
 	sci_glb_write(REG_PMU_APB_PD_GPU_TOP_CFG,
