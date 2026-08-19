@@ -1,0 +1,184 @@
+From c0caa2a93f9fb4d1c155f105c75fea7b96c1158c Mon Sep 17 00:00:00 2001
+From: "lima 3.10 backport" <backport@lima.local>
+Date: Tue, 18 Aug 2026 23:30:30 +0000
+Subject: [PATCH 6/6] tools: lima_smoke - minimal lima UAPI ioctl harness
+
+VERSION + GET_PARAM x4 + CTX_CREATE + GEM_CREATE + GEM_INFO + mmap/CPU
+write + GEM_WAIT + cleanup, no Mesa needed. First thing to run on the
+device (see README bring-up order).
+---
+ tools/lima/Makefile     |  15 +++++
+ tools/lima/lima_smoke.c | 139 ++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 154 insertions(+)
+ create mode 100755 tools/lima/Makefile
+ create mode 100755 tools/lima/lima_smoke.c
+
+diff --git a/tools/lima/Makefile b/tools/lima/Makefile
+new file mode 100755
+index 0000000..30b62ed
+--- /dev/null
++++ b/tools/lima/Makefile
+@@ -0,0 +1,15 @@
++# Build lima_smoke for the target. Needs the kernel UAPI headers on the
++# include path (the backport installs include/uapi/drm/lima_drm.h into
++# the vendor tree; DRM headers come from the tree's include/uapi/drm).
++KDIR ?= ../../..
++CROSS_COMPILE ?=
++
++CC = $(CROSS_COMPILE)gcc
++CFLAGS += -Wall -O2 -I$(KDIR)/include/uapi -I$(KDIR)/arch/arm/include/uapi \
++	-I$(KDIR)/include -I$(KDIR)/arch/arm/include
++
++lima_smoke: lima_smoke.c
++	$(CC) $(CFLAGS) -o $@ $<
++
++clean:
++	rm -f lima_smoke
+diff --git a/tools/lima/lima_smoke.c b/tools/lima/lima_smoke.c
+new file mode 100755
+index 0000000..905ebbd
+--- /dev/null
++++ b/tools/lima/lima_smoke.c
+@@ -0,0 +1,139 @@
++// SPDX-License-Identifier: GPL-2.0 OR MIT
++/*
++ * lima_smoke.c - minimal lima UAPI exerciser for bring-up on the
++ * 3.10 backport: VERSION -> GET_PARAM x4 -> CTX_CREATE -> GEM_CREATE ->
++ * GEM_INFO -> mmap + CPU write -> GEM_WAIT -> cleanup. Exercises probe,
++ * GEM alloc, GPU-VA mapping, CPU mmap path. No GL, no submit (a real
++ * GP/PP job needs Mesa-built frames; do that next per the README).
++ *
++ * Build (target): see Makefile. Run on device: ./lima_smoke /dev/dri/card0
++ */
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <stdint.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <errno.h>
++#include <sys/ioctl.h>
++#include <sys/mman.h>
++
++#include <drm/lima_drm.h>
++#include <drm/drm.h>
++
++static int fails;
++
++#define CHECK(name, cond) do { \
++	if (cond) { printf("PASS %s\n", name); } \
++	else { printf("FAIL %s (errno=%d %s)\n", name, errno, strerror(errno)); fails++; } \
++} while (0)
++
++int main(int argc, char **argv)
++{
++	const char *path = argc > 1 ? argv[1] : "/dev/dri/card0";
++	int fd, ret;
++
++	fd = open(path, O_RDWR);
++	if (fd < 0) {
++		printf("FAIL open %s: %s\n", path, strerror(errno));
++		return 1;
++	}
++	printf("PASS open %s\n", path);
++
++	/* DRM core version: proves the driver bound */
++	{
++		char name[64] = {0}, desc[128] = {0};
++		struct drm_version v = {0};
++		v.name_len = sizeof(name); v.name = name;
++		desc[0] = 0; v.desc_len = sizeof(desc); v.desc = desc;
++		ret = ioctl(fd, DRM_IOCTL_VERSION, &v);
++		CHECK("VERSION", ret == 0);
++		printf("  driver: %s %d.%d.%d (%s)\n", name, v.version_major,
++		       v.version_minor, v.version_patchlevel, desc);
++	}
++
++	/* GET_PARAM: gpu id / pp count / versions - proves power+regs+irqs */
++	{
++		uint64_t gpu_id = 0, num_pp = 0, gpv = 0, ppv = 0;
++		struct drm_lima_get_param p = {0};
++
++		p.param = DRM_LIMA_PARAM_GPU_ID;
++		ret = ioctl(fd, DRM_IOCTL_LIMA_GET_PARAM, &p);
++		gpu_id = p.value; CHECK("GET_PARAM gpu_id", ret == 0 &&
++			gpu_id == DRM_LIMA_PARAM_GPU_ID_MALI400);
++		p.param = DRM_LIMA_PARAM_NUM_PP;
++		ret = ioctl(fd, DRM_IOCTL_LIMA_GET_PARAM, &p);
++		num_pp = p.value; CHECK("GET_PARAM num_pp", ret == 0 && num_pp == 2);
++		p.param = DRM_LIMA_PARAM_GP_VERSION;
++		ret = ioctl(fd, DRM_IOCTL_LIMA_GET_PARAM, &p);
++		gpv = p.value; CHECK("GET_PARAM gp_version", ret == 0 && gpv != 0);
++		p.param = DRM_LIMA_PARAM_PP_VERSION;
++		ret = ioctl(fd, DRM_IOCTL_LIMA_GET_PARAM, &p);
++		ppv = p.value; CHECK("GET_PARAM pp_version", ret == 0 && ppv != 0);
++		printf("  gpu_id=%llu num_pp=%llu gp=0x%llx pp=0x%llx\n",
++		       (unsigned long long)gpu_id, (unsigned long long)num_pp,
++		       (unsigned long long)gpv, (unsigned long long)ppv);
++	}
++
++	/* context */
++	uint32_t ctx = 0;
++	{
++		struct drm_lima_ctx_create c = {0};
++		ret = ioctl(fd, DRM_IOCTL_LIMA_CTX_CREATE, &c);
++		ctx = c.id; CHECK("CTX_CREATE", ret == 0 && ctx != 0);
++	}
++
++	/* gem create + info + mmap + write + wait */
++	uint32_t handle = 0;
++	void *map = MAP_FAILED;
++	{
++		struct drm_lima_gem_create g = {0};
++		g.size = 1024 * 1024;
++		ret = ioctl(fd, DRM_IOCTL_LIMA_GEM_CREATE, &g);
++		handle = g.handle; CHECK("GEM_CREATE 1MB", ret == 0 && handle != 0);
++
++		struct drm_lima_gem_info gi = {0};
++		gi.handle = handle;
++		ret = ioctl(fd, DRM_IOCTL_LIMA_GEM_INFO, &gi);
++		CHECK("GEM_INFO", ret == 0 && gi.offset != 0);
++		printf("  va=0x%x mmap_offset=0x%llx\n", gi.va,
++		       (unsigned long long)gi.offset);
++
++		if (ret == 0) {
++			map = mmap(NULL, g.size, PROT_READ | PROT_WRITE,
++				   MAP_SHARED, fd, gi.offset);
++			CHECK("mmap bo", map != MAP_FAILED);
++			if (map != MAP_FAILED) {
++				memset(map, 0x5a, 4096);
++				CHECK("cpu write", ((volatile uint32_t *)map)[0]
++				      == 0x5a5a5a5a);
++			}
++		}
++
++		struct drm_lima_gem_wait w = {0};
++		w.handle = handle;
++		w.op = LIMA_GEM_WAIT_READ | LIMA_GEM_WAIT_WRITE;
++		w.timeout_ns = 1000000000LL;  /* 1s, relative-here shim */
++		ret = ioctl(fd, DRM_IOCTL_LIMA_GEM_WAIT, &w);
++		CHECK("GEM_WAIT (idle bo)", ret == 0);
++	}
++
++	if (map != MAP_FAILED)
++		munmap(map, 1024 * 1024);
++	if (handle) {
++		struct drm_gem_close gc = {0};
++		gc.handle = handle;
++		ret = ioctl(fd, DRM_IOCTL_GEM_CLOSE, &gc);
++		CHECK("GEM_CLOSE", ret == 0);
++	}
++	if (ctx) {
++		struct drm_lima_ctx_free cf = {0};
++		cf.id = ctx;
++		ret = ioctl(fd, DRM_IOCTL_LIMA_CTX_FREE, &cf);
++		CHECK("CTX_FREE", ret == 0);
++	}
++	close(fd);
++
++	printf(fails ? "SMOKE: %d FAILURES\n" : "SMOKE: ALL PASS\n", fails);
++	return fails ? 1 : 0;
++}
+-- 
+2.53.0
+

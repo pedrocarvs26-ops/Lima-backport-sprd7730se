@@ -1,0 +1,21 @@
+# Lima 3.10 backport - defconfig delta, verified against gtel3g_defconfig
+# (gtel3g/kernel_samsung_gtel3g, branch lineage-16.0 = Linux 3.10.103)
+#
+# 1. Vendor driver OFF (built-in in the stock defconfig; unsetting MALI400
+#    drops the whole mali400 option block):
+# CONFIG_MALI400 is not set
+#
+# 2. lima + DRM core ON (stock defconfig has "# CONFIG_DRM is not set"):
+CONFIG_DRM=y
+CONFIG_DRM_LIMA=m
+#
+# 3. Keep the rest of the stock graphics config unchanged:
+#    CONFIG_ION=y / CONFIG_ION_SPRD=y   (Android still uses ION for gralloc;
+#                                      lima PRIME works next to it)
+#    CONFIG_SPRD_IOMMU=y               (used by camera/video blocks; the
+#                                      vendor mali driver does NOT use it
+#                                      for the GPU - verified - and lima
+#                                      drives the Mali's internal MMU)
+#    # CONFIG_CMA is not set           (fine; lima does not need CMA)
+#    # CONFIG_MODVERSIONS is not set   (recommended while iterating: avoids
+#                                      the genksyms host-tool dependency)

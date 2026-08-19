@@ -1,0 +1,489 @@
+From 711ad42f2db5797f6d0cb7232d50e7e6a0bf61fd Mon Sep 17 00:00:00 2001
+From: "lima 3.10 backport" <backport@lima.local>
+Date: Tue, 18 Aug 2026 23:30:30 +0000
+Subject: [PATCH 2/6] drm/lima: 3.10 compatibility layer
+
+lima_compat.h: shims for post-3.10 API used by the v5.2 driver:
+u64_to_user_ptr, kvcalloc/kvfree, kmem_cache_create_usercopy,
+readl_poll_timeout (iopoll.h is absent in 3.10), dma_alloc_wc,
+drm_gem_object get/put renames, 3.10 drm_gem_object_lookup signature,
+lima_timeout_abs_to_jiffies, LIMA_GFP_DMA32.
+
+lima_compat_fence.h/.c: mini dma_fence (3.10 predates the fence/
+reservation framework): signalable completion object, waitqueue based,
+IRQ-safe slab release, wait returns fence errors.
+
+lima_compat_resv.h: mini reservation object embedded in struct lima_bo
+(mutex + exclusive fence + growable shared array) for implicit sync.
+---
+ drivers/gpu/drm/lima/lima_compat.c       | 212 +++++++++++++++++++++++
+ drivers/gpu/drm/lima/lima_compat.h       | 117 +++++++++++++
+ drivers/gpu/drm/lima/lima_compat_fence.h |  66 +++++++
+ drivers/gpu/drm/lima/lima_compat_resv.h  |  39 +++++
+ 4 files changed, 434 insertions(+)
+ create mode 100755 drivers/gpu/drm/lima/lima_compat.c
+ create mode 100755 drivers/gpu/drm/lima/lima_compat.h
+ create mode 100755 drivers/gpu/drm/lima/lima_compat_fence.h
+ create mode 100755 drivers/gpu/drm/lima/lima_compat_resv.h
+
+diff --git a/drivers/gpu/drm/lima/lima_compat.c b/drivers/gpu/drm/lima/lima_compat.c
+new file mode 100755
+index 0000000..7655362
+--- /dev/null
++++ b/drivers/gpu/drm/lima/lima_compat.c
+@@ -0,0 +1,212 @@
++// SPDX-License-Identifier: GPL-2.0 OR MIT
++/*
++ * lima_compat.c - mini dma_fence + reservation object implementation.
++ * See lima_compat_fence.h / lima_compat_resv.h for the design notes.
++ */
++
++#include <linux/slab.h>
++#include <linux/module.h>
++#include <linux/ktime.h>
++
++#include "lima_compat.h"
++
++/* ---------------- mini dma_fence ---------------- */
++
++static struct kmem_cache *lima_fence_slab;
++
++int lima_fence_slab_init(void)
++{
++	lima_fence_slab = kmem_cache_create("lima_fence",
++					    sizeof(struct dma_fence), 0,
++					    SLAB_HWCACHE_ALIGN, NULL);
++	return lima_fence_slab ? 0 : -ENOMEM;
++}
++
++void lima_fence_slab_fini(void)
++{
++	kmem_cache_destroy(lima_fence_slab);
++}
++
++struct dma_fence *lima_fence_create(const char *name)
++{
++	struct dma_fence *f;
++
++	f = kmem_cache_zalloc(lima_fence_slab, GFP_KERNEL);
++	if (!f)
++		return NULL;
++	kref_init(&f->refcount);
++	init_waitqueue_head(&f->wait);
++	f->status = 0;
++	f->name = name;
++	return f;
++}
++
++static void lima_fence_release(struct kref *kref)
++{
++	struct dma_fence *f = container_of(kref, struct dma_fence, refcount);
++
++	/* kmem_cache_free never sleeps: safe from irq context */
++	kmem_cache_free(lima_fence_slab, f);
++}
++
++void dma_fence_put(struct dma_fence *f)
++{
++	if (f)
++		kref_put(&f->refcount, lima_fence_release);
++}
++
++/* single-signaler invariant (only the pipe completion path signals);
++ * first signal wins, later ones (e.g. timeout vs irq race) lose. */
++static int lima_fence_do_signal(struct dma_fence *f, int v)
++{
++	if (cmpxchg(&f->status, 0, v) != 0)
++		return -EBUSY;
++	f->timestamp_ns = ktime_to_ns(ktime_get());
++	wake_up_all(&f->wait);
++	return 0;
++}
++
++int dma_fence_signal(struct dma_fence *f)
++{
++	return lima_fence_do_signal(f, 1);
++}
++
++int dma_fence_signal_error(struct dma_fence *f, int error)
++{
++	if (error >= 0)
++		error = -EIO;
++	return lima_fence_do_signal(f, error);
++}
++
++long dma_fence_wait_timeout(struct dma_fence *f, bool intr, long timeout)
++{
++	long ret;
++
++	if (dma_fence_is_signaled(f))
++		return f->status < 0 ? f->status : timeout;
++
++	if (intr)
++		ret = wait_event_interruptible_timeout(f->wait,
++						       dma_fence_is_signaled(f),
++						       timeout);
++	else
++		ret = wait_event_timeout(f->wait, dma_fence_is_signaled(f),
++					 timeout);
++
++	if (ret < 0)
++		return ret;		/* -ERESTARTSYS */
++	if (ret == 0 && !dma_fence_is_signaled(f))
++		return 0;			/* genuine timeout */
++	if (f->status < 0)
++		return f->status;
++	return ret ? ret : 1;
++}
++
++/* ---------------- mini reservation object ---------------- */
++
++void lima_resv_init(struct lima_resv *resv)
++{
++	mutex_init(&resv->lock);
++	resv->fence_excl = NULL;
++	resv->shared = NULL;
++	resv->num_shared = 0;
++	resv->max_shared = 0;
++}
++
++void lima_resv_fini(struct lima_resv *resv)
++{
++	u32 i;
++
++	dma_fence_put(resv->fence_excl);
++	for (i = 0; i < resv->num_shared; i++)
++		dma_fence_put(resv->shared[i]);
++	kfree(resv->shared);
++}
++
++int lima_resv_set_excl(struct lima_resv *resv, struct dma_fence *fence)
++{
++	mutex_lock(&resv->lock);
++	dma_fence_put(resv->fence_excl);
++	resv->fence_excl = fence;	/* takes caller's reference */
++	mutex_unlock(&resv->lock);
++	return 0;
++}
++
++int lima_resv_add_shared(struct lima_resv *resv, struct dma_fence *fence)
++{
++	int ret = 0;
++
++	mutex_lock(&resv->lock);
++	if (resv->num_shared == resv->max_shared) {
++		u32 nmax = resv->max_shared ? resv->max_shared * 2 : 4;
++		struct dma_fence **n;
++
++		n = krealloc(resv->shared, nmax * sizeof(*n), GFP_KERNEL);
++		if (!n) {
++			ret = -ENOMEM;
++			goto out;
++		}
++		resv->shared = n;
++		resv->max_shared = nmax;
++	}
++	resv->shared[resv->num_shared++] = dma_fence_get(fence);
++out:
++	mutex_unlock(&resv->lock);
++	return ret;
++}
++
++int lima_resv_get_fences(struct lima_resv *resv, struct dma_fence ***fences)
++{
++	u32 i, n = 0;
++	struct dma_fence **arr;
++
++	mutex_lock(&resv->lock);
++	if (resv->fence_excl)
++		n++;
++	n += resv->num_shared;
++	if (!n) {
++		mutex_unlock(&resv->lock);
++		*fences = NULL;
++		return 0;
++	}
++	arr = kcalloc(n, sizeof(*arr), GFP_KERNEL);
++	if (!arr) {
++		mutex_unlock(&resv->lock);
++		return -ENOMEM;
++	}
++	n = 0;
++	if (resv->fence_excl)
++		arr[n++] = dma_fence_get(resv->fence_excl);
++	for (i = 0; i < resv->num_shared; i++)
++		arr[n++] = dma_fence_get(resv->shared[i]);
++	mutex_unlock(&resv->lock);
++
++	*fences = arr;
++	return n;
++}
++
++long lima_resv_wait_timeout(struct lima_resv *resv, bool intr, long timeout)
++{
++	struct dma_fence **fences;
++	int i, n;
++	long ret = timeout;
++
++	n = lima_resv_get_fences(resv, &fences);
++	if (n < 0)
++		return n;
++	for (i = 0; i < n; i++) {
++		long r = dma_fence_wait_timeout(fences[i], intr, timeout);
++
++		dma_fence_put(fences[i]);
++		if (r < 0) {		/* error or interrupted */
++			ret = r;
++			break;
++		}
++		if (r == 0)
++			ret = 0;	/* timed out; keep waiting the rest out */
++	}
++	while (++i < n)
++		dma_fence_put(fences[i]);
++	kfree(fences);
++	return ret;
++}
+diff --git a/drivers/gpu/drm/lima/lima_compat.h b/drivers/gpu/drm/lima/lima_compat.h
+new file mode 100755
+index 0000000..35ea2df
+--- /dev/null
++++ b/drivers/gpu/drm/lima/lima_compat.h
+@@ -0,0 +1,117 @@
++/* SPDX-License-Identifier: GPL-2.0 OR MIT */
++/*
++ * lima_compat.h - 3.10 compatibility shims for the v5.2 lima backport.
++ *
++ * Self-contained on purpose: mkseries.sh prepends this header to the
++ * verbatim-kept upstream files, so it must be includable first and must
++ * not rely on anything else from the driver. Semantics notes for every
++ * shim are in docs/gap-analysis.md section 2.
++ */
++#ifndef __LIMA_COMPAT_H__
++#define __LIMA_COMPAT_H__
++
++#include <linux/version.h>
++#include <linux/types.h>
++#include <linux/slab.h>
++#include <linux/vmalloc.h>
++#include <linux/ktime.h>
++#include <linux/jiffies.h>
++#include <linux/delay.h>
++#include <linux/io.h>
++#include <linux/gfp.h>
++#include <linux/dma-mapping.h>
++#include <linux/device.h>
++
++#include <drm/drmP.h>
++
++#if !defined(DRM_UNLOCKED)
++#error "lima 3.10 backport requires DRM_UNLOCKED in drmP.h"
++#endif
++
++/* ---- small helpers from newer kernels -------------------------------- */
++
++/* 3.10 has ACCESS_ONCE, not READ_ONCE/WRITE_ONCE (3.18+) */
++#ifndef READ_ONCE
++#define READ_ONCE(x) ACCESS_ONCE(x)
++#endif
++#ifndef WRITE_ONCE
++#define WRITE_ONCE(x, v) (ACCESS_ONCE(x) = (v))
++#endif
++
++#ifndef u64_to_user_ptr
++#define u64_to_user_ptr(x) ((void __user *)(unsigned long)(x))
++#endif
++
++/* v4.12+: kvcalloc/kvfree. lima's allocations are small; kmalloc is fine. */
++static inline void *kvcalloc(size_t n, size_t size, gfp_t flags)
++{
++	return kcalloc(n, size, flags);
++}
++#define kvfree(p) kfree(p)
++
++/* v4.16+ hardening API; plain kmem_cache_create on 3.10. */
++#define kmem_cache_create_usercopy(name, size, align, flags, uoff, usize, ctor) \
++	kmem_cache_create(name, size, align, flags, ctor)
++
++/*
++ * 3.10 has no <linux/iopoll.h> (mkseries strips those includes from the
++ * kept files); provide the one helper lima uses for reset-wait loops.
++ */
++#ifndef readl_poll_timeout
++#define readl_poll_timeout(addr, val, cond, sleep_us, timeout_ms) ({\
++	unsigned long __timeout = jiffies + msecs_to_jiffies(timeout_ms);\
++	int __ret = 0;						\
++	for (;;) {						\
++		(val) = readl(addr);				\
++		if (cond)					\
++			break;					\
++		if (time_after(jiffies, __timeout)) {		\
++			(val) = readl(addr);			\
++			__ret = (cond) ? 0 : -ETIMEDOUT;		\
++			break;					\
++		}						\
++		if (sleep_us)					\
++			udelay(sleep_us);			\
++	}							\
++	__ret;							\
++})
++#endif
++
++/* dma_alloc_wc/dma_free_wc (v4.9+); dma_alloc_attrs exists since 3.4. */
++#define dma_alloc_wc(dev, size, handle, gfp)				\
++	dma_alloc_attrs(dev, size, handle, gfp, DMA_ATTR_WRITE_COMBINE)
++#define dma_free_wc(dev, size, cpu, handle)				\
++	dma_free_attrs(dev, size, cpu, handle, DMA_ATTR_WRITE_COMBINE)
++
++/*
++ * v5.2 allocates BO pages with GFP_DMA32. SC7730SE has at most 1GB RAM
++ * and no >4G addressing, so there is nothing to constrain; 3.10 arm has
++ * no ZONE_DMA32 either. Plain zeroed GFP_KERNEL is the right thing here.
++ */
++#define LIMA_GFP_DMA32	(GFP_KERNEL | __GFP_ZERO)
++
++/* ---- GEM object API renames to the 3.10 names -------------------------- */
++
++#define drm_gem_object_get(obj)		drm_gem_object_reference(obj)
++#define drm_gem_object_put(obj)		drm_gem_object_unreference(obj)
++
++/* 3.10: drm_gem_object_lookup(dev, filp, handle); v5.2 dropped dev. */
++#define lima_gem_object_lookup(filp, handle)				\
++	drm_gem_object_lookup((filp)->minor->dev, filp, handle)
++
++/* replaces v5.2's drm_timeout_abs_to_jiffies() (drm_utils.h, 4.20+) */
++static inline long lima_timeout_abs_to_jiffies(u64 abs_ns)
++{
++	u64 now = ktime_to_ns(ktime_get());
++
++	if ((s64)(abs_ns - now) <= 0)
++		return 0;
++	return (long)nsecs_to_jiffies(abs_ns - now) + 1;
++}
++
++/* ---- mini dma_fence / reservation object ------------------------------- */
++
++#include "lima_compat_fence.h"
++#include "lima_compat_resv.h"
++
++#endif /* __LIMA_COMPAT_H__ */
+diff --git a/drivers/gpu/drm/lima/lima_compat_fence.h b/drivers/gpu/drm/lima/lima_compat_fence.h
+new file mode 100755
+index 0000000..93320c7
+--- /dev/null
++++ b/drivers/gpu/drm/lima/lima_compat_fence.h
+@@ -0,0 +1,66 @@
++/* SPDX-License-Identifier: GPL-2.0 OR MIT */
++/*
++ * Mini dma_fence for the 3.10 lima backport.
++ *
++ * 3.10 predates the dma-fence/reservation framework (reservation_object
++ * landed in 3.17). lima only needs a signalable per-task completion
++ * object plus a wait primitive, so this is a deliberately small subset
++ * wearing upstream-shaped names:
++ *
++ *  - status: 0 = unsignaled, 1 = signaled ok, <0 = signaled with error
++ *    (mmu fault / timeout) - the error reaches waiters, unlike upstream
++ *    dma_fence_wait which hides it; lima submits treat <0 as job failure.
++ *  - no callbacks, no RCU: waiters sleep on a waitqueue, release is a
++ *    kmem_cache_free, so dma_fence_put() is IRQ-safe (called from the
++ *    gp/pp irq handlers).
++ *
++ * dma_fence_wait_timeout() returns >0 remaining jiffies, 0 on timeout,
++ * <0 on fence error (or -ERESTARTSYS if intr and interrupted).
++ */
++#ifndef __LIMA_COMPAT_FENCE_H__
++#define __LIMA_COMPAT_FENCE_H__
++
++#include <linux/kref.h>
++#include <linux/spinlock.h>
++#include <linux/wait.h>
++#include <linux/sched.h>
++#include <linux/errno.h>
++#include <linux/compiler.h>
++
++struct dma_fence {
++	struct kref refcount;
++	wait_queue_head_t wait;
++	int status;		/* 0 unsignaled, 1 ok, <0 error */
++	const char *name;	/* string literal, never freed */
++	u64 timestamp_ns;
++};
++
++struct dma_fence *lima_fence_create(const char *name);
++
++static inline struct dma_fence *dma_fence_get(struct dma_fence *f)
++{
++	kref_get(&f->refcount);
++	return f;
++}
++
++void dma_fence_put(struct dma_fence *f);		/* IRQ-safe */
++
++int dma_fence_signal(struct dma_fence *f);		/* -> status = 1 */
++int dma_fence_signal_error(struct dma_fence *f, int error);
++
++static inline bool dma_fence_is_signaled(struct dma_fence *f)
++{
++	return READ_ONCE(f->status) != 0;
++}
++
++long dma_fence_wait_timeout(struct dma_fence *f, bool intr, long timeout);
++
++static inline long dma_fence_wait(struct dma_fence *f, bool intr)
++{
++	return dma_fence_wait_timeout(f, intr, MAX_SCHEDULE_TIMEOUT);
++}
++
++int lima_fence_slab_init(void);
++void lima_fence_slab_fini(void);
++
++#endif /* __LIMA_COMPAT_FENCE_H__ */
+diff --git a/drivers/gpu/drm/lima/lima_compat_resv.h b/drivers/gpu/drm/lima/lima_compat_resv.h
+new file mode 100755
+index 0000000..a95c8b8
+--- /dev/null
++++ b/drivers/gpu/drm/lima/lima_compat_resv.h
+@@ -0,0 +1,39 @@
++/* SPDX-License-Identifier: GPL-2.0 OR MIT */
++/*
++ * Mini reservation object for the 3.10 lima backport, embedded in
++ * struct lima_bo (upstream shares one reservation_object between BOs;
++ * a per-BO object is sufficient for lima's implicit-sync model: each
++ * submitted writer replaces the exclusive fence, readers append to the
++ * shared set - which in Mesa's lima usage stays empty most of the time).
++ */
++#ifndef __LIMA_COMPAT_RESV_H__
++#define __LIMA_COMPAT_RESV_H__
++
++#include <linux/mutex.h>
++
++struct dma_fence;
++
++struct lima_resv {
++	struct mutex lock;
++	struct dma_fence *fence_excl;	/* most recent writer */
++	struct dma_fence **shared;	/* concurrent readers (rare) */
++	u32 num_shared;
++	u32 max_shared;
++};
++
++void lima_resv_init(struct lima_resv *resv);
++void lima_resv_fini(struct lima_resv *resv);
++
++/* takes over the caller's fence reference */
++int lima_resv_set_excl(struct lima_resv *resv, struct dma_fence *fence);
++/* takes its own reference */
++int lima_resv_add_shared(struct lima_resv *resv, struct dma_fence *fence);
++
++/* snapshot excl+shared with refs taken; caller kfree()s *fences.
++ * returns fence count (>=0) or -ENOMEM. */
++int lima_resv_get_fences(struct lima_resv *resv, struct dma_fence ***fences);
++
++/* wait for every fence present when called; >0, 0 timeout, <0 error */
++long lima_resv_wait_timeout(struct lima_resv *resv, bool intr, long timeout);
++
++#endif /* __LIMA_COMPAT_RESV_H__ */
+-- 
+2.53.0
+

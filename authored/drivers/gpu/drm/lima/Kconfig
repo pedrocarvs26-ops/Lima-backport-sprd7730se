@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: GPL-2.0 OR MIT
+# 3.10 backport of the v5.2 lima Kconfig (no DRM_SCHED to select here).
+
+config DRM_LIMA
+	tristate "LIMA (DRM support for ARM Mali 400/450 GPU) - 3.10 backport"
+	depends on DRM
+	depends on ARM
+	depends on MMU
+	depends on OF
+	depends on !MALI400	# conflicts with the vendor closed mali driver
+	select DMA_SHARED_BUFFER
+	help
+	  DRM render driver for ARM Mali-400/450 GPUs, backported from
+	  Linux v5.2 to this 3.10 tree. Render only: display stays with
+	  the vendor fbdev driver.
+
+	  The vendor closed-source mali400 driver (CONFIG_MALI400) drives
+	  the same hardware; both cannot be enabled at once. Disable
+	  CONFIG_MALI400 to use this driver.
+
+	  If unsure, say M.

@@ -1,0 +1,161 @@
+From f47c5bd935898b2618d5e78db47652de94c93c56 Mon Sep 17 00:00:00 2001
+From: "lima 3.10 backport" <backport@lima.local>
+Date: Tue, 18 Aug 2026 23:30:30 +0000
+Subject: [PATCH 5/6] arm: scx30g2 lima GPU DT fragment + board-file notes
+
+arch/arm/boot/dts/scx30g2-lima-gpu.dtsi carries the verified
+vendor-tree values (gtel3g/kernel_samsung_gtel3g, lineage-16.0):
+reg 0x60000000/0x10000, the shared GIC SPI 39 interrupt listed once per
+lima irq name, and the clk_gpu_axi/clk_gpu clocks as bus/core. Replace
+the vendor "sprd,mali-utgard" node in sprd-scx35_sc7730.dtsi with it.
+Documentation/arm/sprd/lima-sc7730se.txt has the platform_device
+fallback for non-DT kernels.
+---
+ Documentation/arm/sprd/lima-sc7730se.txt | 66 ++++++++++++++++++++++++
+ arch/arm/boot/dts/scx30g2-lima-gpu.dtsi  | 61 ++++++++++++++++++++++
+ 2 files changed, 127 insertions(+)
+ create mode 100755 Documentation/arm/sprd/lima-sc7730se.txt
+ create mode 100755 arch/arm/boot/dts/scx30g2-lima-gpu.dtsi
+
+diff --git a/Documentation/arm/sprd/lima-sc7730se.txt b/Documentation/arm/sprd/lima-sc7730se.txt
+new file mode 100755
+index 0000000..38f78bb
+--- /dev/null
++++ b/Documentation/arm/sprd/lima-sc7730se.txt
+@@ -0,0 +1,66 @@
++lima on SC7730SE (scx30g2) - board integration notes
++====================================================
++
++The SC7730SE GPU is a Mali-400 MP2 at register base 0x60000000 with a
++single shared interrupt line (GIC SPI 39). Two integration routes:
++
++1. Device tree (preferred; the gtel3g vendor tree is DT-based,
++   CONFIG_MACH_SCX35_DT=y):
++
++   - replace the vendor "gpu" node (compatible "sprd,mali-utgard") in
++     arch/arm/boot/dts/sprd-scx35_sc7730.dtsi with the lima node from
++     arch/arm/boot/dts/scx30g2-lima-gpu.dtsi (same reg/irq/clocks, new
++     compatible and irq names),
++   - rebuild the board dtb (e.g. sprd-scx35_gtel3g_rev11.dtb).
++
++   The lima node references the clk_gpu_axi/clk_gpu clock nodes from
++   scx30g2-clocks.dtsi as "bus"/"core"; the vendor sprd clock driver
++   registers them, so no clock platform code is needed.
++
++2. platform_data fallback (for non-DT kernels):
++
++   static struct lima_platform_data mali_pdata = {
++	.gpu_id = 0,          /* lima_gpu_mali400 */
++	.power_on = NULL,     /* NULL -> built-in SC7730SE sequence */
++	.power_off = NULL,
++   };
++
++   static struct resource mali_resources[] = {
++	{ .start = 0x60000000, .end = 0x6000ffff,
++	  .flags = IORESOURCE_MEM, .name = "regs" },
++	/* same shared irq six times, in lima's irq-name order */
++	{ .start = IRQ_GPUSHARED, .end = ..., .flags = IORESOURCE_IRQ, .name = "gp" },
++	{ ..., .name = "gpmmu" }, { ..., .name = "pp0" }, { ..., .name = "ppmmu0" },
++	{ ..., .name = "pp1" }, { ..., .name = "ppmmu1" },
++   };
++
++   static struct platform_device mali_device = {
++	.name = "lima", .id = -1,
++	.dev = { .platform_data = &mali_pdata },
++	.resource = mali_resources,
++	.num_resources = ARRAY_SIZE(mali_resources),
++   };
++
++   (lima_platform_sprd.c provides the SC7730SE power-domain sequence by
++   default; board pdata may override power_on/off.)
++
++Power sequencing
++----------------
++
++The GPU sits behind the PD_GPU_TOP power domain. The on/off sequence in
++drivers/gpu/drm/lima/lima_platform_sprd.c is ported from the vendor
++mali400 driver (drivers/gpu/mali400/r4p1/platform/sc8830/mali_platform.c):
++program the PD_GPU_TOP power-on delays, clear BIT_PD_GPU_TOP_FORCE_SHUTDOWN,
++poll REG_PMU_APB_PWR_STATUS0_DBG until the domain reports on. Clock order
++matters: the GPU core-clock control register (0x60100004) lives inside the
++GPU power domain, so the driver powers the domain before enabling clocks;
++the AXI gate (clk_gpu_axi, AON space) may be toggled anytime.
++
++Interrupts
++----------
++
++All GPU blocks share one GIC line (SPI 39). lima requests each IP block's
++irq with IRQF_SHARED and each handler returns IRQ_NONE when its block has
++no pending interrupt, so no driver change is needed - the DT node just
++lists the same interrupt once per name (gp, gpmmu, pp0, ppmmu0, pp1,
++ppmmu1). The pmu irq is optional in lima and absent on this SoC.
+diff --git a/arch/arm/boot/dts/scx30g2-lima-gpu.dtsi b/arch/arm/boot/dts/scx30g2-lima-gpu.dtsi
+new file mode 100755
+index 0000000..e294094
+--- /dev/null
++++ b/arch/arm/boot/dts/scx30g2-lima-gpu.dtsi
+@@ -0,0 +1,61 @@
++/* SPDX-License-Identifier: GPL-2.0 OR MIT */
++/*
++ * Mali-400 MP2 GPU node for the Spreadtrum SC7730SE (scx30g2), for the
++ * 3.10 lima backport. REAL VALUES, verified against the vendor tree
++ * gtel3g/kernel_samsung_gtel3g (branch lineage-16.0 = Linux 3.10.103):
++ *   - arch/arm/boot/dts/sprd-scx35_sc7730.dtsi:  gpu { ... } node
++ *     ("sprd,mali-utgard", reg windows, shared irq <0 39 0x0> x6, clocks)
++ *   - arch/arm/boot/dts/scx30g2-clocks.dtsi:     clk_gpu / clk_gpu_axi
++ *
++ * HOW TO USE (vendor tree): the stock sprd-scx35_sc7730.dtsi already
++ * contains a vendor "gpu" node (compatible "sprd,mali-utgard") driving
++ * the closed mali400 driver. REPLACE that node with this one (or edit
++ * it in place): same register windows/irqs/clocks, new compatible,
++ * lima's irq names, and drop mali_pp_core_number (lima detects the PP
++ * count from the hardware; the vendor value <4> is for the MP4 sc9830).
++ *
++ * postmarketOS: #include this fragment from the device dts instead.
++ */
++
++/ {
++	gpu: gpu@60000000 {
++		compatible = "arm,mali-400";
++		/* whole Mali-400 block; lima applies the per-IP offsets itself
++		 * (gp +0x0000, l2 +0x1000, pmu +0x2000, gpmmu +0x3000,
++		 *  ppmmu0 +0x4000, ppmmu1 +0x5000, pp0 +0x8000, pp1 +0xa000) */
++		reg = <0x60000000 0x10000>;
++		/*
++		 * scx30g2 wires ONE shared GPU interrupt line (GIC SPI 39):
++		 * the vendor node lists <0 39 0x0> six times (its driver uses
++		 * CONFIG_MALI_SHARED_INTERRUPTS). lima requests each IP's irq
++		 * with IRQF_SHARED and its handlers early-out with IRQ_NONE
++		 * when their block has no pending status, so the shared line
++		 * works unmodified: list the same interrupt once per name.
++		 */
++		interrupts = <0 39 0x0>,	/* gp */
++			     <0 39 0x0>,	/* gpmmu */
++			     <0 39 0x0>,	/* pp0 */
++			     <0 39 0x0>,	/* ppmmu0 */
++			     <0 39 0x0>,	/* pp1 */
++			     <0 39 0x0>;	/* ppmmu1 */
++		interrupt-names = "gp", "gpmmu",
++				  "pp0", "ppmmu0",
++				  "pp1", "ppmmu1";
++		/*
++		 * Clock nodes from scx30g2-clocks.dtsi (registered by the
++		 * vendor sprd clock driver):
++		 *   clk_gpu_axi - GPU AXI/bus gate (AON space, safe anytime)
++		 *   clk_gpu     - GPU core clock (mux 153m6..460m8 + div; its
++		 *                 control register 0x60100004 sits inside the
++		 *                 GPU power domain - enabled only after the
++		 *                 domain is up, which the driver handles)
++		 * lima maps "bus" -> clk_gpu_axi and "core" -> clk_gpu. The
++		 * vendor mali driver runs the core at 312 MHz; to pin it:
++		 *   assigned-clocks = <&clk_gpu>;
++		 *   assigned-clock-rates = <312000000>;
++		 */
++		clocks = <&clk_gpu_axi>, <&clk_gpu>;
++		clock-names = "bus", "core";
++		status = "okay";
++	};
++};
+-- 
+2.53.0
+

@@ -1,0 +1,66 @@
+lima on SC7730SE (scx30g2) - board integration notes
+====================================================
+
+The SC7730SE GPU is a Mali-400 MP2 at register base 0x60000000 with a
+single shared interrupt line (GIC SPI 39). Two integration routes:
+
+1. Device tree (preferred; the gtel3g vendor tree is DT-based,
+   CONFIG_MACH_SCX35_DT=y):
+
+   - replace the vendor "gpu" node (compatible "sprd,mali-utgard") in
+     arch/arm/boot/dts/sprd-scx35_sc7730.dtsi with the lima node from
+     arch/arm/boot/dts/scx30g2-lima-gpu.dtsi (same reg/irq/clocks, new
+     compatible and irq names),
+   - rebuild the board dtb (e.g. sprd-scx35_gtel3g_rev11.dtb).
+
+   The lima node references the clk_gpu_axi/clk_gpu clock nodes from
+   scx30g2-clocks.dtsi as "bus"/"core"; the vendor sprd clock driver
+   registers them, so no clock platform code is needed.
+
+2. platform_data fallback (for non-DT kernels):
+
+   static struct lima_platform_data mali_pdata = {
+	.gpu_id = 0,          /* lima_gpu_mali400 */
+	.power_on = NULL,     /* NULL -> built-in SC7730SE sequence */
+	.power_off = NULL,
+   };
+
+   static struct resource mali_resources[] = {
+	{ .start = 0x60000000, .end = 0x6000ffff,
+	  .flags = IORESOURCE_MEM, .name = "regs" },
+	/* same shared irq six times, in lima's irq-name order */
+	{ .start = IRQ_GPUSHARED, .end = ..., .flags = IORESOURCE_IRQ, .name = "gp" },
+	{ ..., .name = "gpmmu" }, { ..., .name = "pp0" }, { ..., .name = "ppmmu0" },
+	{ ..., .name = "pp1" }, { ..., .name = "ppmmu1" },
+   };
+
+   static struct platform_device mali_device = {
+	.name = "lima", .id = -1,
+	.dev = { .platform_data = &mali_pdata },
+	.resource = mali_resources,
+	.num_resources = ARRAY_SIZE(mali_resources),
+   };
+
+   (lima_platform_sprd.c provides the SC7730SE power-domain sequence by
+   default; board pdata may override power_on/off.)
+
+Power sequencing
+----------------
+
+The GPU sits behind the PD_GPU_TOP power domain. The on/off sequence in
+drivers/gpu/drm/lima/lima_platform_sprd.c is ported from the vendor
+mali400 driver (drivers/gpu/mali400/r4p1/platform/sc8830/mali_platform.c):
+program the PD_GPU_TOP power-on delays, clear BIT_PD_GPU_TOP_FORCE_SHUTDOWN,
+poll REG_PMU_APB_PWR_STATUS0_DBG until the domain reports on. Clock order
+matters: the GPU core-clock control register (0x60100004) lives inside the
+GPU power domain, so the driver powers the domain before enabling clocks;
+the AXI gate (clk_gpu_axi, AON space) may be toggled anytime.
+
+Interrupts
+----------
+
+All GPU blocks share one GIC line (SPI 39). lima requests each IP block's
+irq with IRQF_SHARED and each handler returns IRQ_NONE when its block has
+no pending interrupt, so no driver change is needed - the DT node just
+lists the same interrupt once per name (gp, gpmmu, pp0, ppmmu0, pp1,
+ppmmu1). The pmu irq is optional in lima and absent on this SoC.
