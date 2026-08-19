@@ -1,6 +1,6 @@
-From 6353f010b9183cb523aeedac0f35e80b81dc852d Mon Sep 17 00:00:00 2001
+From 7fd2c02f66366305aab5a2c8fbff5f7965954a7a Mon Sep 17 00:00:00 2001
 From: "lima 3.10 backport" <backport@lima.local>
-Date: Wed, 19 Aug 2026 00:41:08 +0000
+Date: Wed, 19 Aug 2026 00:55:35 +0000
 Subject: [PATCH 5/6] arm: scx30g2 lima GPU DT fragment + board-file notes
 
 arch/arm/boot/dts/scx30g2-lima-gpu.dtsi carries the verified

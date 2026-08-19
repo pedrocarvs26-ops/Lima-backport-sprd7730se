@@ -1,6 +1,6 @@
-From e0394c38d3b07e0c19865e42ad21157862fc3406 Mon Sep 17 00:00:00 2001
+From b2d44e5bb8c3f36290bd61d9939e21d694e31d67 Mon Sep 17 00:00:00 2001
 From: "lima 3.10 backport" <backport@lima.local>
-Date: Wed, 19 Aug 2026 00:41:08 +0000
+Date: Wed, 19 Aug 2026 00:55:34 +0000
 Subject: [PATCH 2/6] drm/lima: 3.10 compatibility layer
 
 lima_compat.h: shims for post-3.10 API used by the v5.2 driver:
@@ -17,10 +17,10 @@ lima_compat_resv.h: mini reservation object embedded in struct lima_bo
 (mutex + exclusive fence + growable shared array) for implicit sync.
 ---
  drivers/gpu/drm/lima/lima_compat.c       | 212 +++++++++++++++++++++++
- drivers/gpu/drm/lima/lima_compat.h       | 117 +++++++++++++
+ drivers/gpu/drm/lima/lima_compat.h       | 127 ++++++++++++++
  drivers/gpu/drm/lima/lima_compat_fence.h |  66 +++++++
  drivers/gpu/drm/lima/lima_compat_resv.h  |  39 +++++
- 4 files changed, 434 insertions(+)
+ 4 files changed, 444 insertions(+)
  create mode 100755 drivers/gpu/drm/lima/lima_compat.c
  create mode 100755 drivers/gpu/drm/lima/lima_compat.h
  create mode 100755 drivers/gpu/drm/lima/lima_compat_fence.h
@@ -246,10 +246,10 @@ index 0000000..7655362
 +}
 diff --git a/drivers/gpu/drm/lima/lima_compat.h b/drivers/gpu/drm/lima/lima_compat.h
 new file mode 100755
-index 0000000..35ea2df
+index 0000000..1d7d999
 --- /dev/null
 +++ b/drivers/gpu/drm/lima/lima_compat.h
-@@ -0,0 +1,117 @@
+@@ -0,0 +1,127 @@
 +/* SPDX-License-Identifier: GPL-2.0 OR MIT */
 +/*
 + * lima_compat.h - 3.10 compatibility shims for the v5.2 lima backport.
@@ -268,6 +268,7 @@ index 0000000..35ea2df
 +#include <linux/vmalloc.h>
 +#include <linux/ktime.h>
 +#include <linux/jiffies.h>
++#include <linux/math64.h>
 +#include <linux/delay.h>
 +#include <linux/io.h>
 +#include <linux/gfp.h>
@@ -351,6 +352,15 @@ index 0000000..35ea2df
 +#define lima_gem_object_lookup(filp, handle)				\
 +	drm_gem_object_lookup((filp)->minor->dev, filp, handle)
 +
++/* 3.10 keeps nsecs_to_jiffies() in kernel/time/jiffies.c but does NOT
++ * export it to modules, which breaks lima.ko at modpost. Re-implement it
++ * with div_u64() (exported), rounding up like nsecs_to_jiffies64(). */
++static inline unsigned long lima_nsecs_to_jiffies(u64 n)
++{
++	return (unsigned long)div_u64(n + NSEC_PER_SEC / HZ - 1,
++				      NSEC_PER_SEC / HZ);
++}
++
 +/* replaces v5.2's drm_timeout_abs_to_jiffies() (drm_utils.h, 4.20+) */
 +static inline long lima_timeout_abs_to_jiffies(u64 abs_ns)
 +{
@@ -358,7 +368,7 @@ index 0000000..35ea2df
 +
 +	if ((s64)(abs_ns - now) <= 0)
 +		return 0;
-+	return (long)nsecs_to_jiffies(abs_ns - now) + 1;
++	return (long)lima_nsecs_to_jiffies(abs_ns - now) + 1;
 +}
 +
 +/* ---- mini dma_fence / reservation object ------------------------------- */

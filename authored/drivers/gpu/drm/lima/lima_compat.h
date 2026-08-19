@@ -16,6 +16,7 @@
 #include <linux/vmalloc.h>
 #include <linux/ktime.h>
 #include <linux/jiffies.h>
+#include <linux/math64.h>
 #include <linux/delay.h>
 #include <linux/io.h>
 #include <linux/gfp.h>
@@ -99,6 +100,15 @@ static inline void *kvcalloc(size_t n, size_t size, gfp_t flags)
 #define lima_gem_object_lookup(filp, handle)				\
 	drm_gem_object_lookup((filp)->minor->dev, filp, handle)
 
+/* 3.10 keeps nsecs_to_jiffies() in kernel/time/jiffies.c but does NOT
+ * export it to modules, which breaks lima.ko at modpost. Re-implement it
+ * with div_u64() (exported), rounding up like nsecs_to_jiffies64(). */
+static inline unsigned long lima_nsecs_to_jiffies(u64 n)
+{
+	return (unsigned long)div_u64(n + NSEC_PER_SEC / HZ - 1,
+				      NSEC_PER_SEC / HZ);
+}
+
 /* replaces v5.2's drm_timeout_abs_to_jiffies() (drm_utils.h, 4.20+) */
 static inline long lima_timeout_abs_to_jiffies(u64 abs_ns)
 {
@@ -106,7 +116,7 @@ static inline long lima_timeout_abs_to_jiffies(u64 abs_ns)
 
 	if ((s64)(abs_ns - now) <= 0)
 		return 0;
-	return (long)nsecs_to_jiffies(abs_ns - now) + 1;
+	return (long)lima_nsecs_to_jiffies(abs_ns - now) + 1;
 }
 
 /* ---- mini dma_fence / reservation object ------------------------------- */

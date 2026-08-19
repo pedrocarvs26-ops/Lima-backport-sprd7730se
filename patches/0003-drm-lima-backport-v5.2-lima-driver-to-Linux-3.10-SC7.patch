@@ -1,6 +1,6 @@
-From 175df5e6452c3b3655ad66690b88bfa5bd1bb147 Mon Sep 17 00:00:00 2001
+From 523ee0d6a59c7ed7707c8f6d57068760e49e083b Mon Sep 17 00:00:00 2001
 From: "lima 3.10 backport" <backport@lima.local>
-Date: Wed, 19 Aug 2026 00:41:08 +0000
+Date: Wed, 19 Aug 2026 00:55:35 +0000
 Subject: [PATCH 3/6] drm/lima: backport v5.2 lima driver to Linux 3.10
  (SC7730SE)
 
